@@ -14,6 +14,8 @@ _DOH_HASH=$(grep '^DOH_HASHED_PASS=' /env-file 2>/dev/null | head -1 | cut -d= -
 # Strip surrounding quotes if user added them
 _DOH_USER=$(echo "$_DOH_USER" | sed "s/^['\"]//;s/['\"]$//")
 _DOH_HASH=$(echo "$_DOH_HASH" | sed "s/^['\"]//;s/['\"]$//")
+# Accept hashes copied from shell-escaped settings. YAML double quotes do not allow `\$`.
+_DOH_HASH=$(printf '%s' "$_DOH_HASH" | sed 's/\\\$/\$/g')
 
 # --- Read non-sensitive vars from environment (no $ in their values) ---
 _DOMAIN="${DOMAIN:-}"
