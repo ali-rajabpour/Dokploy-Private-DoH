@@ -1,295 +1,252 @@
-# Self-Hosted DNS-over-HTTPS (DoH)
+# Dokploy-Private-DoH
 
-> **Author:** Ali Rajabpour Sanati — [Rajabpour.com](https://rajabpour.com)
+> Password-protected DNS-over-HTTPS with caching and strict upstream failover — for Dokploy and Traefik v3.
 
-Run your own **private DNS-over-HTTPS** endpoint behind Traefik using Docker Compose. The server forwards DNS queries over **DNS-over-HTTPS (DoH)** to multiple upstream resolvers (Cloudflare, AdGuard, NextDNS) via a `dnscrypt-proxy` sidecar, while Traefik handles TLS termination, automatic certificates, and basic authentication. All external traffic is encrypted end-to-end over port 443.
+Run your own DoH endpoint (`https://resolver.example.com/dns-query`) that only you can use. Queries go to **your NextDNS profile first**. If NextDNS fails, they go to Cloudflare, then Quad9. Every hop that leaves the server is encrypted. It deploys as a Dokploy compose app and is configured entirely from the Environment tab.
+
+**Author:** Ali Rajabpour Sanati — [Rajabpour.com](https://rajabpour.com)
 
 ---
 
 ## Contents
 
-1. [Features](#features)
-2. [Architecture](#architecture)
-3. [Requirements](#requirements)
-4. [Quick Start](#quick-start)
-5. [Configuration](#configuration)
-6. [Environment Variables](#environment-variables)
-7. [Server Configuration (`doh-server.conf`)](#server-configuration)
-8. [Traefik Integration](#traefik-integration)
-9. [Client Setup](#client-setup)
-10. [Verifying the Endpoint](#verifying-the-endpoint)
-11. [FAQ](#faq)
-12. [License](#license)
+1. [Why](#why)
+2. [Features](#features)
+3. [Architecture](#architecture)
+4. [Requirements](#requirements)
+5. [Quick start (Dokploy)](#quick-start-dokploy)
+6. [Configuration](#configuration)
+7. [Client setup](#client-setup)
+8. [Verifying the endpoint](#verifying-the-endpoint)
+9. [Cloudflare proxy (orange cloud)](#cloudflare-proxy-orange-cloud)
+10. [Security and threat model](#security-and-threat-model)
+11. [Upgrading from the dnscrypt-proxy / Unbound version](#upgrading-from-the-dnscrypt-proxy--unbound-version)
+12. [FAQ](#faq)
+13. [License](#license)
 
 ---
+
+## Why
+
+Public DoH resolvers are either open to everyone or tied to one provider. This project gives you:
+
+- **One private endpoint for every device and OS.** Change upstreams once on the server instead of on every client.
+- **Real failover.** NextDNS is always tried first. Cloudflare and Quad9 are used only when NextDNS fails. Most clients accept only one custom DoH server, so they cannot do this on their own.
+- **A shared cache.** Popular names are prefetched before they expire.
+- **Your client IP stays hidden from the upstream.** NextDNS sees your server's IP, not your home or mobile IP.
+- **Harder to block.** Your own domain is harder to block than well-known resolver hostnames. It is harder still behind Cloudflare.
+
+What it does **not** give you: more privacy from your upstream. NextDNS still sees every query, and your profile ties those queries to you. See [Security and threat model](#security-and-threat-model).
 
 ## Features
 
-- **Private** — keep your DNS queries on your own infrastructure.
-- **End-to-end encryption** — HTTPS from client to server, DoH (HTTPS/443) from server to upstreams. All external traffic is encrypted.
-- **Aggressive caching** — Unbound with `prefetch` (refreshes entries *before* TTL expires) and `serve-expired` (returns stale data instantly, refreshes in background). Repeat queries are near-instant.
-- **NextDNS primary, failover to Cloudflare / AdGuard** — `dnscrypt-proxy` with `lb_strategy = 'first'` always uses NextDNS, falling back only if it's down.
-- **Basic authentication** — Traefik basicAuth middleware protects the endpoint so only you can use it.
-- **Automatic TLS** — Let's Encrypt certificates managed by Traefik.
-- **No credential escaping** — the `app-config` script reads the `.env` file directly at startup, so `$` signs in bcrypt hashes are never mangled by Docker Compose.
-- **Custom config file** (`doh-server.conf`) mounted into the container for full control over upstream and performance settings.
+- **Two auth methods, use either or both**
+  - **Secret path** — `https://resolver.example.com/dns-query/<secret>`. Works in every DoH client, including ones with no username/password fields.
+  - **HTTP Basic Auth** — for clients with username and password fields.
+- **Strict upstream order** — Blocky `strategy: strict`: NextDNS, then Cloudflare, then Quad9, each tried only if the previous one fails or times out (2 s).
+- **Encrypted everywhere** — client → Traefik is HTTPS. Server → upstreams is DoH. Even the bootstrap lookups use DoH to an IP address.
+- **Cache with prefetching** — upstream TTLs are respected, with no forced minimums.
+- **Rate limiting** — per client IP, and it uses the real client IP behind Cloudflare.
+- **Cloudflare orange-cloud mode** — the origin accepts traffic only from Cloudflare IP ranges.
+- **Minimal attack surface**
+  - The internet-facing resolver runs as non-root on a scratch image.
+  - Only a one-shot init container, never reachable from the internet, writes Traefik's config.
+  - Plain DNS listens on loopback only.
+- **No `$` escaping** — bcrypt hashes are read straight from `.env`, so Docker Compose never mangles them.
+- **Fails loudly** — invalid or missing settings stop the deploy with a clear error instead of starting an open resolver.
 
 ## Architecture
 
-```text
-                         Docker internal network
-┌──────────┐ HTTPS ┌─────────┐       ┌────────────┐       ┌─────────┐       ┌────────────────┐ DoH(443)
-│  Client   │─────▶│ Traefik │──────▶│ doh-server  │──────▶│ Unbound │──────▶│ dnscrypt-proxy │────────▶ NextDNS
-│           │      │ • TLS   │       │             │       │ • cache │       │ • DoH upstream │────────▶ Cloudflare
-│ Little    │      │ • Auth  │       │             │       │ • pre-  │       │ • NextDNS 1st  │────────▶ AdGuard
-│ Snitch /  │      │         │       └────────────┘       │   fetch │       │ • failover     │
-│ curl      │      └─────────┘                             └─────────┘       └────────────────┘
-└──────────┘
+```mermaid
+flowchart LR
+    C[Client] -->|HTTPS| CF[Cloudflare proxy<br/>optional]
+    CF -->|HTTPS| T
+    C -.->|HTTPS, grey cloud| T[Traefik<br/>TLS · auth · rate limit]
+    T -->|HTTP, internal| B[Blocky<br/>cache · prefetch]
+    B -->|DoH 1st| N[NextDNS profile]
+    B -.->|DoH if NextDNS fails| CL[Cloudflare DNS]
+    B -.->|DoH if both fail| Q[Quad9]
+    I[config-init<br/>one-shot] -. writes .-> T
+    I -. writes .-> B
 ```
 
-> **Why not DoT (port 853)?** Many VPS providers block outbound port 853. DoH uses port 443 (standard HTTPS), which is virtually never blocked. Security is equivalent — both encrypt DNS queries with TLS.
+| Service | Image | Role |
+| --- | --- | --- |
+| `config-init` | `busybox` | Reads and validates `.env`, writes the Blocky config and the Traefik dynamic config, then exits. No network. |
+| `blocky` | `spx01/blocky` | Serves DoH on internal port 4000. Caches, prefetches, and forwards to the upstreams in strict order. |
+
+Why DoH upstreams instead of DoT (port 853)? Many VPS providers block outbound 853. DoH uses 443, which is virtually never blocked.
 
 ## Requirements
 
-- A server with **Docker** and **Docker Compose**
-- **Traefik v2+** already running and listening on ports 80/443
-- A public hostname (e.g. `resolver.example.com`) with a DNS A record pointing to the server IP
-- `htpasswd` (from `apache2-utils`) to generate a bcrypt password hash
+- **Dokploy** — or any **Traefik v3** that uses a file provider directory. See the Traefik variables in [Configuration](#configuration).
+- A DNS A/AAAA record for `resolver.<your-domain>` pointing to the server.
+- Optional: a [NextDNS](https://nextdns.io) profile.
+- `htpasswd` (macOS built-in; `apache2-utils` on Debian/Ubuntu) and `openssl` to generate credentials.
 
-> **Note:** Traefik must share a Docker network with this stack (default: `dokploy-network`). Adjust in `docker-compose.yml` if you use a different network name.
+## Quick start (Dokploy)
 
-## Quick Start
+1. **Create a Compose app** in Dokploy. Source: this repository, compose file `docker-compose.yml`.
+2. **Generate credentials** on your own machine:
 
-```bash
-# 1. Clone the repo
-git clone https://github.com/ali-rajabpour/Personal-DoH.git
-cd Personal-DoH
+   ```bash
+   # Secret path (works with every client)
+   openssl rand -hex 24
 
-# 2. Create your .env from the template
-cp env-example .env
+   # Basic Auth (optional). Copy the part after "myuser:"
+   htpasswd -nbB myuser 'a-long-random-password'
+   ```
 
-# 3. Generate a bcrypt hash for basic auth
-htpasswd -Bbn myuser mypassword
-# Copy the hash (everything after "myuser:") into DOH_HASHED_PASS in .env
+3. **Environment tab** — paste the contents of [`env-example`](env-example) and fill in `DOMAIN`, `DOH_SECRET_PATH` and/or `DOH_USER` + `DOH_HASHED_PASS`, and `NEXTDNS_ID`. Each variable is explained in the file.
+4. **Deploy.** Check the `config-init` logs. It prints the endpoint, the enabled auth methods and the upstream order, or a clear error.
+5. **Test** with [Verifying the endpoint](#verifying-the-endpoint).
 
-# 4. Edit .env — set your domain and credentials
-vim .env
-
-# 5. Start the stack
-docker compose up -d
-```
-
-After startup the DoH endpoint is available at:
-
-```text
-https://resolver.<DOMAIN>/dns-query
-```
+Without Dokploy: `cp env-example .env`, edit it, set the Traefik variables, and make sure the external network in `docker-compose.yml` matches your Traefik network. Then run `docker compose up -d`.
 
 ## Configuration
 
-| File | Purpose |
-| ---- | ------- |
-| `docker-compose.yml` | Service definitions (doh-server + Unbound + dnscrypt-proxy), volumes, networking |
-| `doh-server.conf` | DoH server config: upstream, timeouts, retries |
-| `unbound.conf` | Caching resolver: prefetch, serve-expired, forwarding |
-| `dnscrypt-proxy.toml` | Upstream DoH config: server priority, failover, bootstrap |
-| `app-config` | Startup script that writes Traefik routing + auth config |
-| `.env` (from `env-example`) | Domain, path prefix, auth credentials |
+All settings live in `.env` (the Dokploy Environment tab). [`env-example`](env-example) is the reference, with a how-to for each one.
 
-## Environment Variables
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DOMAIN` | — | Apex domain. The endpoint is `<DOH_SUBDOMAIN>.<DOMAIN>`. |
+| `DOH_SUBDOMAIN` | `resolver` | Subdomain label. |
+| `DOH_SECRET_PATH` | — | 24+ chars `[A-Za-z0-9_-]`. Enables `/dns-query/<secret>`. |
+| `DOH_USER` / `DOH_HASHED_PASS` | — | Basic Auth user and **bcrypt hash**. No escaping, no quotes needed. |
+| `NEXTDNS_ID` | — | NextDNS profile ID. Queried first. |
+| `FALLBACK_UPSTREAMS` | Cloudflare, Quad9 | Comma-separated. `https://…` (DoH), `tcp-tls:host` (DoT), `quic:host` (DoQ). |
+| `CLOUDFLARE_PROXY` | `false` | `true` when the record is orange-clouded. |
+| `TRAEFIK_ENTRYPOINT` | `websecure` | Traefik HTTPS entrypoint name. |
+| `TRAEFIK_CERT_RESOLVER` | `letsencrypt` | Traefik certificate resolver name. |
+| `TRAEFIK_DYNAMIC_DIR` | `/etc/dokploy/traefik/dynamic` | Host directory watched by Traefik's file provider. |
 
-| Variable | Example | Description |
-| -------- | ------- | ----------- |
-| `DOMAIN` | `example.com` | Apex domain only — the FQDN is built as `resolver.<DOMAIN>`. |
-| `DOH_HTTP_PREFIX` | `/dns-query` | URL path the DoH server listens on. |
-| `DOH_SERVER_LISTEN` | `8053` | Internal container port. |
-| `DOH_USER` | `myusername` | Username for HTTP Basic Auth. |
-| `DOH_HASHED_PASS` | `$2y$05$vI8...` | **Bcrypt hash** from `htpasswd -Bbn`. No `$` escaping needed. |
+At least one auth method must be set, or the deploy fails.
 
-Credentials are read directly from the mounted `.env` file at container startup (not via Docker Compose environment variable substitution), so `$` signs in the bcrypt hash are never mangled.
+Cache, logging and bootstrap settings are in [`blocky.yml`](blocky.yml). The `upstreams:` section is generated from `.env` on every deploy.
 
-> **Important — plain text vs hash:**
->
-> | Where | What to use |
-> | ----- | ----------- |
-> | `.env` file (`DOH_HASHED_PASS`) | The **bcrypt hash** (starts with `$2y$`) |
-> | Little Snitch / curl / any client | The **plain text password** you chose when running `htpasswd` |
->
-> The server stores only the hash. Clients send the plain password; Traefik hashes it on the fly and compares. **Never put the hash into a client** — it will always return 401.
+**Plaintext vs hash:** `.env` holds the **hash** (`$2y$…`). Clients get the **plain password**. Putting the hash into a client always returns 401.
 
-## Server Configuration
+## Client setup
 
-`doh-server.conf` is a TOML file mounted into the container. Supported options:
-
-- **`listen`** — address and port the server binds to (default `":8053"`)
-- **`path`** — HTTP path for DNS queries (must match `DOH_HTTP_PREFIX`)
-- **`upstream`** — list of upstream DNS resolvers in `<proto>:<host>:<port>` format
-- **`timeout`** — seconds before an upstream query times out (default `5`)
-- **`tries`** — number of retry attempts across upstreams on failure (default `3`)
-- **`verbose`** — enable detailed logging (`true` / `false`)
-- **`cert`** / **`key`** — TLS cert/key paths (left empty — Traefik handles TLS)
-
-The default configuration forwards queries to Unbound (`tcp:unbound:53`), which caches responses and forwards cache misses to `dnscrypt-proxy` for encrypted upstream resolution via DoH. You generally do not need to change `doh-server.conf`.
-
-### Unbound (caching layer)
-
-`unbound.conf` provides the aggressive caching that makes repeat queries near-instant:
-
-- **`prefetch: yes`** — when a cached entry reaches 10% remaining TTL, Unbound proactively refreshes it in the background. Popular domains never expire from cache.
-- **`serve-expired: yes`** — if a cached entry has expired, Unbound returns the stale data *immediately* (TTL=30) and refreshes in the background. Zero perceived latency on expiry.
-- **`cache-min-ttl: 300`** — entries stay cached for at least 5 minutes even if the upstream TTL is shorter.
-- **`msg-cache-size: 64m`** / **`rrset-cache-size: 128m`** — generous cache sizes.
-- **`qname-minimisation: yes`** — privacy: only sends the minimum necessary query to each upstream hop.
-
-### dnscrypt-proxy (encrypted upstream)
-
-`dnscrypt-proxy.toml` handles the encrypted connection to upstream DoH servers:
-
-- **`server_names`** — `['nextdns', 'cloudflare', 'adguard-dns-doh']` — ordered by priority
-- **`lb_strategy = 'first'`** — always use NextDNS; Cloudflare and AdGuard are fallbacks only
-- **`doh_servers = true`** — only use DoH (port 443) servers
-- **`bootstrap_resolvers`** — plain DNS used *only* to resolve DoH server hostnames on first start
-
-> **Note:** Options like `upstream_selector`, `weight`, and `[cache]` are **not** supported by the `doh-server` binary (they belong to the `doh-client` component). Do not add them to `doh-server.conf`.
-
-## Traefik Integration
-
-This project uses the **Traefik file provider** for routing — not Docker labels. At container startup the `app-config` script:
-
-1. Reads `DOH_USER` and `DOH_HASHED_PASS` directly from the mounted `.env` file (immune to Compose `$` interpolation).
-2. Reads `DOMAIN` and `DOH_HTTP_PREFIX` from the container environment.
-3. Writes a complete Traefik dynamic config containing:
-   - **HTTPS router** with TLS via Let's Encrypt and `doh-auth` basicAuth middleware (priority 200).
-   - **HTTP → HTTPS redirect router**.
-   - **Service** pointing to `http://doh-server:8053`.
-   - **basicAuth middleware** with `user:bcrypt_hash`.
-
-Traefik watches the dynamic config directory and picks up changes automatically. No manual Traefik file editing is required after deployment.
-
-## Client Setup
-
-### Little Snitch (macOS)
-
-Requires **Little Snitch 6.1.3** or later (added DoH password authentication support).
-
-1. Open **Little Snitch Settings → DNS Encryption**.
-2. Enable **DNS Encryption**.
-3. Set **Encrypted DNS Server** to **Custom**.
-4. Choose **DNS over HTTPS (DoH)** as the transport.
-5. Fill in the fields:
-
-   | Field | Value |
-   | ----- | ----- |
-   | Server URL | `https://resolver.example.com/dns-query` |
-   | Username | your `DOH_USER` value (e.g. `myusername`) |
-   | Password | your **plain text** password — the one you typed into `htpasswd`, **not** the `$2y$` hash |
-   | Server SPKI | *(leave empty)* |
-
-6. Click **OK**, then click **Test** to verify.
-
-> **Troubleshooting:**
->
-> - **401 Unauthorized** — you are most likely entering the bcrypt hash instead of the plain text password. The Password field must contain the original password, not the `$2y$05$...` string from your `.env` file.
-> - **"Wrong URL"** — try the URL without the path (`https://resolver.example.com`) — some versions auto-append `/dns-query`. Also ensure your Mac can resolve the hostname via its current DNS settings before switching.
-
-### macOS / iOS / Little Snitch (DNS profile)
-
-Create an Apple configuration profile (`.mobileconfig`) with the DoH payload. Tools like [dns-profile-creator](https://github.com/niclas-edn/dns-profile-creator) can generate one. Use the server URL with embedded credentials (plain text password, **not** the hash):
+Use the secret-path URL wherever a client has only a URL field:
 
 ```text
-https://myuser:mypassword@resolver.example.com/dns-query
+https://resolver.example.com/dns-query/<DOH_SECRET_PATH>
 ```
 
-### Browsers (Firefox, Chrome)
+Use Basic Auth where a client has username and password fields: URL `https://resolver.example.com/dns-query`, plus username and the **plain** password.
 
-Most browsers do **not** support HTTP Basic Auth for DoH natively. If your browser allows a custom DoH URL, try the embedded-credential format:
+| Client | Method | Notes |
+| --- | --- | --- |
+| **YogaDNS** (Windows) | Secret path or Basic Auth | Add a custom DoH server. Tested. |
+| **Little Snitch 6.1.3+** (macOS) | Secret path or Basic Auth | Settings → DNS Encryption → Custom → DNS over HTTPS. Tested. |
+| **Windows 11** native | Secret path | Settings → Network → DNS → Encrypted (manual template). |
+| **Firefox** | Secret path | Settings → Privacy & Security → DNS over HTTPS → Custom. |
+| **Chrome / Edge / Brave** | Secret path | Settings → Security → Use secure DNS → Custom. |
+| **iOS / macOS profile** | Secret path | A `.mobileconfig` with a `DNSSettings` payload, `DNSProtocol` = `HTTPS`, `ServerURL` = the secret-path URL. |
+| **Android apps** (Intra, Rethink DNS, …) | Secret path | Android's built-in "Private DNS" is DoT only and cannot use this. |
+| **curl** | Either | See below. |
 
-```text
-https://myuser:mypassword@resolver.example.com/dns-query
-```
+Rows not marked "Tested" follow the client's documented DoH support but have not been verified with this project. Please open an issue with results.
 
-> **Note:** Firefox supports custom DoH URLs in `about:config` → `network.trr.uri`, but does not reliably pass embedded credentials. Browser DoH with basic auth may require a local proxy such as `dnscrypt-proxy`.
+Troubleshooting:
 
-### curl
+- **401** — you entered the bcrypt hash instead of the plain password, or the username is wrong.
+- **404** — wrong secret path, or the Host/path doesn't match `DOMAIN` / `DOH_SUBDOMAIN`.
+- **403** — `CLOUDFLARE_PROXY=true` while the record is grey, or a Cloudflare security feature is blocking the client (see [Cloudflare](#cloudflare-proxy-orange-cloud)).
+- **429** — rate limit hit (50 req/s, burst 200 per client IP).
 
-Use `-u 'user:plainpassword'` — the **plain text** password, not the hash:
+## Verifying the endpoint
+
+`AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE` is a base64url DNS wire-format query for `example.com A`.
 
 ```bash
-curl -s -H 'accept: application/dns-message' \
-  -u 'myuser:mypassword' \
-  'https://resolver.example.com/dns-query?dns=AAEBAAABAAAAAAAABmdvb2dsZQNjb20AAAEAAQ'
+Q='dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE'
+H='https://resolver.example.com'
+
+# Secret path → 200
+curl -s -o /dev/null -w '%{http_code}\n' -H 'accept: application/dns-message' "$H/dns-query/<DOH_SECRET_PATH>?$Q"
+
+# Basic Auth → 200
+curl -s -o /dev/null -w '%{http_code}\n' -H 'accept: application/dns-message' -u 'myuser:plain-password' "$H/dns-query?$Q"
+
+# No credentials → 401 (Basic Auth enabled) or 404 (secret path only)
+curl -s -o /dev/null -w '%{http_code}\n' "$H/dns-query?$Q"
+
+# Wrong secret → 401 / 404
+curl -s -o /dev/null -w '%{http_code}\n' "$H/dns-query/wrong?$Q"
 ```
 
-## Verifying the Endpoint
+To confirm NextDNS answers: open the NextDNS dashboard → Logs while you run a query. With `dig` 9.18+: `dig @resolver.example.com +https=/dns-query/<secret> example.com`.
+
+To test the config renderer locally: `sh tests/render-test.sh`.
+
+## Cloudflare proxy (orange cloud)
+
+Proxying hides your server's IP. **Cloudflare terminates TLS, so it sees every DNS query and the credentials** — the secret path and the Basic Auth password. No auth scheme avoids that. You are choosing to trust Cloudflare in exchange for hiding the origin.
+
+Setup:
+
+1. Move the domain's DNS to Cloudflare with all records **DNS only (grey)** first. Confirm everything still works.
+2. **SSL/TLS → Overview → Full (strict).** Traefik already has a valid Let's Encrypt certificate.
+3. Leave **Always Use HTTPS** off. Its HTTP → HTTPS redirect happens at Cloudflare and breaks Let's Encrypt HTTP-01 renewals. If you want it on, add a Configuration Rule that exempts `/.well-known/acme-challenge/*`.
+4. Turn the `resolver` record **Proxied (orange)**.
+5. Set `CLOUDFLARE_PROXY=true` and redeploy. Traefik now rejects any request that does not come from a [Cloudflare IP range](https://www.cloudflare.com/ips/), and rate-limits by `CF-Connecting-IP`.
+6. If clients start getting 403 or challenge pages, disable **Bot Fight Mode**, or add a WAF custom rule that skips security features for `URI Path starts with /dns-query`. DoH clients cannot solve challenges.
+
+Notes:
+
+- The origin IP stays hidden only if **every** record pointing to that server is proxied or removed. One grey record on the same IP exposes it.
+- The Cloudflare IP list is hard-coded in `config-init.sh`. Cloudflare changes it rarely. Compare with <https://www.cloudflare.com/ips/> now and then.
+
+## Security and threat model
+
+| Party | What they see |
+| --- | --- |
+| Your network / ISP | TLS to your domain (or to Cloudflare). Not the queries. |
+| Cloudflare (orange cloud only) | Every query, the credentials, your client IP. |
+| Your server / VPS provider | Queries in memory. Blocky logs mask domain names (`log.privacy: true`), and no query log is kept. |
+| NextDNS / fallback upstream | Every query, and your **server's** IP, not your client IP. Your NextDNS profile links the queries to your account. |
+
+Design choices and limits:
+
+- **Credentials.** The secret path is 96+ bits of randomness and cannot be guessed. A Basic Auth password is only as strong as you make it. The rate limit slows guessing but does not stop it, so use a long random password.
+- **Certificate Transparency.** Your hostname appears in public CT logs as soon as a certificate is issued. The auth is what protects the endpoint, not an obscure hostname.
+- **Neighbour containers.** Blocky's HTTP port (4000) can be reached by other containers on the shared Traefik network (`dokploy-network`). Plain DNS is loopback-only.
+- **DNSSEC.** Blocky does not validate signatures itself. It relies on the upstream (NextDNS, Cloudflare and Quad9 all validate). Enable `dnssec.validate` in `blocky.yml` if you want local validation, at the cost of extra upstream lookups.
+- **During failover** your NextDNS blocklists and settings don't apply. Uncached queries also wait up to 2 s for NextDNS to time out.
+- **Geo answers.** CDNs pick servers near your **server**, not near you. Host the server close to where you are.
+
+Report security issues privately via [GitHub Security Advisories](https://github.com/ali-rajabpour/Dokploy-Private-DoH/security/advisories/new).
+
+## Upgrading from the dnscrypt-proxy / Unbound version
+
+The old `doh-server`, `unbound` and `dnscrypt-proxy` services are gone. Docker Compose does not remove containers for services that no longer exist. **Remove them**, or the old `doh-server` may restart after a reboot and overwrite the Traefik config:
 
 ```bash
-# Without credentials → expect 401
-curl -s -o /dev/null -w '%{http_code}' \
-  'https://resolver.example.com/dns-query?dns=AAEBAAABAAAAAAAABmdvb2dsZQNjb20AAAEAAQ'
-
-# With credentials → expect 200
-curl -s -o /dev/null -w '%{http_code}' \
-  -H 'accept: application/dns-message' \
-  -u 'myuser:mypassword' \
-  'https://resolver.example.com/dns-query?dns=AAEBAAABAAAAAAAABmdvb2dsZQNjb20AAAEAAQ'
-
-# Wrong credentials → expect 401
-curl -s -o /dev/null -w '%{http_code}' \
-  -u 'wrong:wrong' \
-  'https://resolver.example.com/dns-query?dns=AAEBAAABAAAAAAAABmdvb2dsZQNjb20AAAEAAQ'
+# In the app's directory on the server (Dokploy: .../compose/<app>/code)
+docker compose up -d --remove-orphans
 ```
 
-The base64url string `AAEBAAABAAAAAAAABmdvb2dsZQNjb20AAAEAAQ` is a DNS wire-format query for `google.com A`.
+Or stop and delete the three old containers in Dokploy. Then update the Environment tab from `env-example`:
+
+- `DOH_SERVER_LISTEN` and `DOH_HTTP_PREFIX` are no longer used.
+- `NEXTDNS_ID` and `DOH_SECRET_PATH` are new.
 
 ## FAQ
 
-### Can I change the upstream DNS resolvers?
+**How do I change the upstreams?** Set `NEXTDNS_ID` and `FALLBACK_UPSTREAMS`, then redeploy.
 
-Edit `server_names` in `dnscrypt-proxy.toml`. The available server names come from the [public resolvers list](https://github.com/DNSCrypt/dnscrypt-resolvers). Common choices: `cloudflare`, `adguard-dns-doh`, `nextdns`, `google`, `quad9-dnscrypt-ip4-nofilter-pri`.
+**How do I rotate credentials?** Generate a new secret or hash, update the Environment tab, and redeploy. The old value stops working immediately.
 
-### Where are logs?
+**Where are the logs?**
+- `docker compose logs config-init` — rendered endpoint, auth methods and upstream order, or validation errors.
+- `docker compose logs -f blocky` — resolver logs.
 
-```bash
-# DoH server logs
-docker compose logs -f doh-server
+**Can I add blocklists?** Blocky supports them (`blocking:` in `blocky.yml`), but NextDNS already does this per profile. Keep blocking in one place.
 
-# Caching resolver logs
-docker compose logs -f unbound
-
-# Upstream DoH resolver logs
-docker compose logs -f dnscrypt-proxy
-```
-
-### How do I update the container image?
-
-```bash
-docker compose pull && docker compose up -d
-```
-
-### How do I change the password?
-
-```bash
-htpasswd -Bbn myuser mynewpassword
-```
-
-Copy the hash into `DOH_HASHED_PASS` in `.env`, then restart:
-
-```bash
-docker compose up -d
-```
-
-### Why not use `[cache]` or `upstream_selector` in `doh-server.conf`?
-
-These options belong to the `doh-client` component of [m13253/dns-over-https](https://github.com/m13253/dns-over-https), not the server. The server binary rejects them with `unknown option` errors. Caching is handled by Unbound instead.
-
-### Why does the container run as root?
-
-The `app-config` script writes Traefik's dynamic config file into a host-mounted directory owned by `root:root`. The container needs write access to that directory. The DoH server binary itself does not require root privileges.
+**How do I update?** Pull the repository and redeploy. Image versions are pinned in `docker-compose.yml`. Bump them deliberately after reading the release notes.
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
-
----
-
-Made with ☕ by [Ali Rajabpour Sanati](https://rajabpour.com)
+MIT — see [LICENSE](LICENSE).

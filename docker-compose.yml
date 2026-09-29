@@ -1,64 +1,43 @@
 services:
-  dnscrypt-proxy:
-    image: klutchell/dnscrypt-proxy:latest
-    hostname: dnscrypt-proxy
-    restart: unless-stopped
-    networks:
-      dns-internal:
-        ipv4_address: 10.53.0.10
+  # Renders the Blocky and Traefik configs from .env, then exits.
+  config-init:
+    image: busybox:1.37.0
+    restart: "no"
+    network_mode: none
+    command: ["sh", "/config-init.sh"]
     volumes:
-      - ./dnscrypt-proxy.toml:/config/dnscrypt-proxy.toml:ro
-    tmpfs:
-      - /cache:size=1m
-    expose:
-      - "5353"
-
-  unbound:
-    image: mvance/unbound:latest
-    hostname: unbound
-    restart: unless-stopped
-    depends_on:
-      - dnscrypt-proxy
-    networks:
-      dns-internal:
-        ipv4_address: 10.53.0.20
-      dokploy-network:
-    volumes:
-      - ./unbound.conf:/opt/unbound/etc/unbound/unbound.conf:ro
-    expose:
-      - "53"
-
-  doh-server:
-    image: satishweb/doh-server:latest
-    hostname: doh-server
-    restart: unless-stopped
-    depends_on:
-      - unbound
-    networks:
-      dns-internal:
-      dokploy-network:
-    user: "0"
-    env_file:
-      - .env
-    volumes:
-      - ./doh-server.conf:/doh-server.conf
-      - ./app-config:/app-config
-      - /etc/dokploy/traefik/dynamic:/traefik-dynamic
+      - ./config-init.sh:/config-init.sh:ro
+      - ./blocky.yml:/blocky-template.yml:ro
       - ./.env:/env-file:ro
-    command: ["/server/doh-server", "-conf", "/doh-server.conf"]
+      - blocky-config:/blocky
+      - ${TRAEFIK_DYNAMIC_DIR:-/etc/dokploy/traefik/dynamic}:/traefik-dynamic
+
+  blocky:
+    image: spx01/blocky:v0.35.0
+    restart: unless-stopped
+    depends_on:
+      config-init:
+        condition: service_completed_successfully
+    environment:
+      BLOCKY_CONFIG_FILE: /config/config.yml
+    volumes:
+      - blocky-config:/config:ro
+    networks:
+      dokploy-network:
+        # Unique name so it cannot collide with another app's "blocky" service
+        # on the shared Traefik network.
+        aliases:
+          - private-doh-blocky
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null 'http://127.0.0.1:8053/dns-query?name=google.com&type=A' || exit 1"]
-      interval: 60s
-      timeout: 30s
-      start_period: 60s
-    expose:
-      - "8053"
+      test: ["CMD", "/app/blocky", "healthcheck", "--bindip", "127.0.0.1", "--port", "5353"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  blocky-config:
 
 networks:
-  dns-internal:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 10.53.0.0/24
   dokploy-network:
     external: true

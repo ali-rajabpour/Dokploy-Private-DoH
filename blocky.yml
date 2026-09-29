@@ -1,0 +1,26 @@
+# Static part of the Blocky config. config-init.sh prepends the `upstreams:`
+# section (built from NEXTDNS_ID and FALLBACK_UPSTREAMS in .env) on every deploy.
+# Reference: https://0xerr0r.github.io/blocky/latest/configuration/
+
+ports:
+  # Plain DNS only on loopback: used by the healthcheck, unreachable from other
+  # containers on the shared Traefik network.
+  dns: "127.0.0.1:5353"
+  # DoH (/dns-query) for Traefik. Not published on the host.
+  http: 4000
+
+# Resolves upstream hostnames (dns.nextdns.io, ...) over DoH by IP, so nothing
+# leaves the server as plain DNS — not even at startup.
+bootstrapDns:
+  - upstream: https://1.1.1.1/dns-query
+  - upstream: https://9.9.9.9/dns-query
+
+caching:
+  # Upstream TTLs are respected as-is. Forcing a minimum TTL breaks failover
+  # records and CDN steering.
+  prefetching: true
+
+log:
+  level: info
+  # Masks domain names in logs.
+  privacy: true

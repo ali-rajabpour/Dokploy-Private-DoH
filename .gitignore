@@ -1,8 +1,6 @@
 .vscode
 .env
 docker-compose.override.yml
-doh-auth.yml
-Google Gemini.html
-Google Gemini_files
 *.log
 *.log.txt
+.claude/handoffs/
