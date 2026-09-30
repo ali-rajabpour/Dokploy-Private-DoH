@@ -48,15 +48,27 @@ FALLBACK_UPSTREAMS=https://cloudflare-dns.com/dns-query,https://dns.quad9.net/dn
 
 # --- Cloudflare ---------------------------------------------------------------
 
-# true  = the resolver record is proxied (orange cloud). Traefik then accepts
-#         requests ONLY from Cloudflare IP ranges and rate-limits per real client IP.
+# true  = the resolver record is proxied (orange cloud). Traefik then requires
+#         Cloudflare's client certificate (Authenticated Origin Pulls / mTLS), so
+#         anyone reaching the server IP directly fails the TLS handshake, and the
+#         rate limit applies per real client (CF-Connecting-IP).
+#         FIRST enable it in Cloudflare: SSL/TLS → Origin Server →
+#         Authenticated Origin Pulls → On. Otherwise every request fails.
 # false = DNS-only (grey cloud) or no Cloudflare.
-# Setting true while the record is grey blocks every client (403).
 CLOUDFLARE_PROXY=false
 
-# --- Traefik (defaults match Dokploy; change for a plain Traefik v3 setup) ---
+# --- Traefik (defaults match Dokploy; change for a plain Traefik setup) ---
 
 TRAEFIK_ENTRYPOINT=websecure
+
+# Certificate for the endpoint:
+#   letsencrypt (or any resolver name) = Traefik obtains it via that ACME resolver.
+#   empty (TRAEFIK_CERT_RESOLVER=)      = use a certificate you already added, e.g.
+#       a Cloudflare Origin Certificate in Dokploy → Settings → Certificates.
+#       Cloudflare Origin certs are trusted only by Cloudflare: use them only with
+#       the orange cloud and SSL/TLS mode Full (strict).
+#   line removed entirely               = letsencrypt.
 TRAEFIK_CERT_RESOLVER=letsencrypt
-# Host directory watched by Traefik's file provider.
+# Directory watched by Traefik's file provider. Must be the same path on the host
+# and inside the Traefik container (true for Dokploy).
 TRAEFIK_DYNAMIC_DIR=/etc/dokploy/traefik/dynamic

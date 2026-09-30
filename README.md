@@ -1,6 +1,6 @@
 # Dokploy-Private-DoH
 
-> Password-protected DNS-over-HTTPS with caching and strict upstream failover — for Dokploy and Traefik v3.
+> Password-protected DNS-over-HTTPS with caching and strict upstream failover — for Dokploy and Traefik v2.11+ / v3.
 
 Run your own DoH endpoint (`https://resolver.example.com/dns-query`) that only you can use. Queries go to **your NextDNS profile first**. If NextDNS fails, they go to Cloudflare, then Quad9. Every hop that leaves the server is encrypted. It deploys as a Dokploy compose app and is configured entirely from the Environment tab.
 
@@ -47,7 +47,8 @@ What it does **not** give you: more privacy from your upstream. NextDNS still se
 - **Encrypted everywhere** — client → Traefik is HTTPS. Server → upstreams is DoH. Even the bootstrap lookups use DoH to an IP address.
 - **Cache with prefetching** — upstream TTLs are respected, with no forced minimums.
 - **Rate limiting** — per client IP, and it uses the real client IP behind Cloudflare.
-- **Cloudflare orange-cloud mode** — the origin accepts traffic only from Cloudflare IP ranges.
+- **Cloudflare orange-cloud mode** — the origin completes TLS only for Cloudflare (Authenticated Origin Pulls / mTLS). Direct hits on the server IP fail the handshake.
+- **Your choice of certificate** — Let's Encrypt, or a certificate you already added (for example a Cloudflare Origin Certificate).
 - **Minimal attack surface**
   - The internet-facing resolver runs as non-root on a scratch image.
   - Only a one-shot init container, never reachable from the internet, writes Traefik's config.
@@ -79,7 +80,7 @@ Why DoH upstreams instead of DoT (port 853)? Many VPS providers block outbound 8
 
 ## Requirements
 
-- **Dokploy** — or any **Traefik v3** that uses a file provider directory. See the Traefik variables in [Configuration](#configuration).
+- **Dokploy** — or any **Traefik v2.11+ or v3** that uses a file provider directory mounted at the same path inside the container. See the Traefik variables in [Configuration](#configuration).
 - A DNS A/AAAA record for `resolver.<your-domain>` pointing to the server.
 - Optional: a [NextDNS](https://nextdns.io) profile.
 - `htpasswd` (macOS built-in; `apache2-utils` on Debian/Ubuntu) and `openssl` to generate credentials.
@@ -115,9 +116,9 @@ All settings live in `.env` (the Dokploy Environment tab). [`env-example`](env-e
 | `DOH_USER` / `DOH_HASHED_PASS` | — | Basic Auth user and **bcrypt hash**. No escaping, no quotes needed. |
 | `NEXTDNS_ID` | — | NextDNS profile ID. Queried first. |
 | `FALLBACK_UPSTREAMS` | Cloudflare, Quad9 | Comma-separated. `https://…` (DoH), `tcp-tls:host` (DoT), `quic:host` (DoQ). |
-| `CLOUDFLARE_PROXY` | `false` | `true` when the record is orange-clouded. |
+| `CLOUDFLARE_PROXY` | `false` | `true` when the record is orange-clouded. Requires Authenticated Origin Pulls in Cloudflare. |
 | `TRAEFIK_ENTRYPOINT` | `websecure` | Traefik HTTPS entrypoint name. |
-| `TRAEFIK_CERT_RESOLVER` | `letsencrypt` | Traefik certificate resolver name. |
+| `TRAEFIK_CERT_RESOLVER` | `letsencrypt` | ACME resolver name. **Empty** = use an existing certificate (e.g. Cloudflare Origin cert from Dokploy's Certificates UI). |
 | `TRAEFIK_DYNAMIC_DIR` | `/etc/dokploy/traefik/dynamic` | Host directory watched by Traefik's file provider. |
 
 At least one auth method must be set, or the deploy fails.
@@ -153,8 +154,9 @@ Troubleshooting:
 
 - **401** — you entered the bcrypt hash instead of the plain password, or the username is wrong.
 - **404** — wrong secret path, or the Host/path doesn't match `DOMAIN` / `DOH_SUBDOMAIN`.
-- **403** — `CLOUDFLARE_PROXY=true` while the record is grey, or a Cloudflare security feature is blocking the client (see [Cloudflare](#cloudflare-proxy-orange-cloud)).
-- **429** — rate limit hit (50 req/s, burst 200 per client IP).
+- **403 / challenge page** — a Cloudflare security feature is blocking the client (see [Cloudflare](#cloudflare-proxy-orange-cloud)).
+- **525/526 or handshake failure** — `CLOUDFLARE_PROXY=true` but Authenticated Origin Pulls is off in Cloudflare (or the record is grey).
+- **429** — rate limit hit (50 req/s, burst 200). This is per client with `CLOUDFLARE_PROXY=true`. Without Cloudflare, Dokploy's Swarm ingress hides client IPs from Traefik, so the limit is shared by all clients.
 
 ## Verifying the endpoint
 
@@ -183,21 +185,27 @@ To test the config renderer locally: `sh tests/render-test.sh`.
 
 ## Cloudflare proxy (orange cloud)
 
-Proxying hides your server's IP. **Cloudflare terminates TLS, so it sees every DNS query and the credentials** — the secret path and the Basic Auth password. No auth scheme avoids that. You are choosing to trust Cloudflare in exchange for hiding the origin.
+Proxying hides the server behind Cloudflare. **Cloudflare terminates TLS, so it sees every DNS query and the credentials** (the secret path and the Basic Auth password). No auth scheme avoids that. You are choosing to trust Cloudflare in exchange for hiding the origin.
+
+**Why mTLS instead of an IP allowlist:** Dokploy publishes Traefik through Docker Swarm's ingress mesh, which rewrites every client address to an internal `10.0.0.x`. Traefik never sees Cloudflare's IPs, so an allowlist would block everyone. Authenticated Origin Pulls checks a client certificate that only Cloudflare presents, and that works regardless of addresses.
 
 Setup:
 
-1. Move the domain's DNS to Cloudflare with all records **DNS only (grey)** first. Confirm everything still works.
-2. **SSL/TLS → Overview → Full (strict).** Traefik already has a valid Let's Encrypt certificate.
-3. Leave **Always Use HTTPS** off. Its HTTP → HTTPS redirect happens at Cloudflare and breaks Let's Encrypt HTTP-01 renewals. If you want it on, add a Configuration Rule that exempts `/.well-known/acme-challenge/*`.
-4. Turn the `resolver` record **Proxied (orange)**.
-5. Set `CLOUDFLARE_PROXY=true` and redeploy. Traefik now rejects any request that does not come from a [Cloudflare IP range](https://www.cloudflare.com/ips/), and rate-limits by `CF-Connecting-IP`.
-6. If clients start getting 403 or challenge pages, disable **Bot Fight Mode**, or add a WAF custom rule that skips security features for `URI Path starts with /dns-query`. DoH clients cannot solve challenges.
+1. Move the domain's DNS to Cloudflare with every record **DNS only (grey)** first. Confirm everything still works.
+2. **SSL/TLS → Overview → Full (strict).**
+3. **Certificate:** either keep `TRAEFIK_CERT_RESOLVER=letsencrypt`, or create a Cloudflare Origin Certificate (SSL/TLS → Origin Server), add it in Dokploy → Settings → Certificates, and set `TRAEFIK_CERT_RESOLVER=` (empty). The Origin certificate lasts up to 15 years and needs no HTTP-01 renewals. Clients that bypass Cloudflare also don't trust it, which is a bonus.
+4. **SSL/TLS → Origin Server → Authenticated Origin Pulls → On.** This applies zone-wide. Other origins that don't ask for the certificate are unaffected.
+5. Turn the `resolver` record **Proxied (orange)**.
+6. Set `CLOUDFLARE_PROXY=true` and redeploy. Test: through Cloudflare → 200. Directly to the server IP (`curl --resolve resolver.example.com:443:<server-ip> …`) → TLS handshake error.
+7. If clients get 403s or challenge pages, add a WAF custom rule: *Hostname equals `resolver.example.com`* → **Skip** all security features. Or disable Bot Fight Mode. DoH clients cannot solve challenges.
 
-Notes:
+With Let's Encrypt, leave **Always Use HTTPS** off, or exempt `/.well-known/acme-challenge/*`, so HTTP-01 renewals still reach Traefik.
 
-- The origin IP stays hidden only if **every** record pointing to that server is proxied or removed. One grey record on the same IP exposes it.
-- The Cloudflare IP list is hard-coded in `config-init.sh`. Cloudflare changes it rarely. Compare with <https://www.cloudflare.com/ips/> now and then.
+Limits:
+
+- Zone-level Authenticated Origin Pulls uses a certificate shared by all Cloudflare customers. It proves "this came through Cloudflare", not "through *your* zone". Auth still protects the endpoint. Per-hostname AOP with your own certificate closes that gap.
+- The origin IP stays hidden only if **every** record pointing at the server is proxied. Passive-DNS databases also keep old records: if a record was ever grey, its IP is already on file.
+- The bundled `cloudflare-origin-pull-ca.pem` expires **2029-11-01**. Replace it from <https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull/set-up/zone-level/> before then.
 
 ## Security and threat model
 
@@ -205,7 +213,7 @@ Notes:
 | --- | --- |
 | Your network / ISP | TLS to your domain (or to Cloudflare). Not the queries. |
 | Cloudflare (orange cloud only) | Every query, the credentials, your client IP. |
-| Your server / VPS provider | Queries in memory. Blocky logs mask domain names (`log.privacy: true`), and no query log is kept. |
+| Your server / VPS provider | Queries in memory. No query log is written (`queryLog.type: none`), and other log lines mask domain names (`log.privacy: true`). |
 | NextDNS / fallback upstream | Every query, and your **server's** IP, not your client IP. Your NextDNS profile links the queries to your account. |
 
 Design choices and limits:

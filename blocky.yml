@@ -20,6 +20,10 @@ caching:
   # records and CDN steering.
   prefetching: true
 
+# No query log at all — not even masked lines in `docker logs`.
+queryLog:
+  type: none
+
 log:
   level: info
   # Masks domain names in logs.

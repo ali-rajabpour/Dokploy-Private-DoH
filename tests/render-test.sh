@@ -8,7 +8,7 @@ T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 
 HASH='$2y$05$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ01234'
-run() { ENV_FILE="$T/env" TEMPLATE=blocky.yml BLOCKY_OUT="$T/blocky.yml" TRAEFIK_OUT="$T/traefik.yml" sh config-init.sh >/dev/null 2>&1; }
+run() { ENV_FILE="$T/env" TEMPLATE=blocky.yml CA_SRC=cloudflare-origin-pull-ca.pem BLOCKY_OUT="$T/blocky.yml" TRAEFIK_OUT="$T/traefik.yml" sh config-init.sh >/dev/null 2>&1; }
 has() { grep -qF -- "$2" "$T/$1" || { echo "FAIL: $1 missing: $2"; exit 1; }; }
 hasnt() { ! grep -qF -- "$2" "$T/$1" || { echo "FAIL: $1 unexpectedly contains: $2"; exit 1; }; }
 rejects() { printf '%s\n' "$2" > "$T/env"; ! run || { echo "FAIL: accepted $1"; exit 1; }; }
@@ -32,17 +32,31 @@ has blocky.yml 'dns: "127.0.0.1:5353"'
 has traefik.yml 'Host(`dns.example.com`) && Path(`/dns-query/0123456789abcdef0123456789abcdef`)'
 has traefik.yml "- \"ali:$HASH\""
 has traefik.yml 'requestHeaderName: CF-Connecting-IP'
-has traefik.yml 'private-doh-cloudflare-only'
+has traefik.yml 'clientAuthType: RequireAndVerifyClientCert'
+has traefik.yml '- /etc/dokploy/traefik/dynamic/private-doh-cloudflare-origin-pull-ca.pem'
+[ "$(grep -c 'options: private-doh-cloudflare' "$T/traefik.yml")" = 2 ] || { echo 'FAIL: both routers must share TLS options'; exit 1; }
+cmp -s cloudflare-origin-pull-ca.pem "$T/private-doh-cloudflare-origin-pull-ca.pem" || { echo 'FAIL: CA not copied'; exit 1; }
+has traefik.yml 'certResolver: letsencrypt'
 has traefik.yml 'path: /dns-query'
 
 # Secret path only, no Cloudflare, no NextDNS.
 printf 'DOMAIN=example.com\nDOH_SECRET_PATH=0123456789abcdef0123456789abcdef\n' > "$T/env"
 run || { echo "FAIL: secret-path-only config rejected"; exit 1; }
 hasnt traefik.yml 'basicAuth'
-hasnt traefik.yml 'ipAllowList'
+hasnt traefik.yml 'clientAuth'
 hasnt traefik.yml 'CF-Connecting-IP'
 hasnt blocky.yml '"https://dns.nextdns.io'
 has traefik.yml 'Host(`resolver.example.com`)'
+
+# Empty TRAEFIK_CERT_RESOLVER = use the certificate Traefik already has.
+printf 'DOMAIN=example.com\nDOH_SECRET_PATH=0123456789abcdef0123456789abcdef\nTRAEFIK_CERT_RESOLVER=\n' > "$T/env"
+run || { echo "FAIL: empty cert resolver rejected"; exit 1; }
+has traefik.yml 'tls: {}'
+hasnt traefik.yml 'certResolver'
+printf 'DOMAIN=example.com\nDOH_SECRET_PATH=0123456789abcdef0123456789abcdef\nTRAEFIK_CERT_RESOLVER=\nCLOUDFLARE_PROXY=true\n' > "$T/env"
+run || { echo "FAIL: empty resolver + cloudflare rejected"; exit 1; }
+hasnt traefik.yml 'certResolver'
+has traefik.yml 'options: private-doh-cloudflare'
 
 rejects "no auth" 'DOMAIN=example.com'
 rejects "short secret" 'DOMAIN=example.com

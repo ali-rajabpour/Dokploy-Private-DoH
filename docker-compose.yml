@@ -8,6 +8,7 @@ services:
     volumes:
       - ./config-init.sh:/config-init.sh:ro
       - ./blocky.yml:/blocky-template.yml:ro
+      - ./cloudflare-origin-pull-ca.pem:/cloudflare-origin-pull-ca.pem:ro
       - ./.env:/env-file:ro
       - blocky-config:/blocky
       - ${TRAEFIK_DYNAMIC_DIR:-/etc/dokploy/traefik/dynamic}:/traefik-dynamic
