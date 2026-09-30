@@ -48,27 +48,22 @@ FALLBACK_UPSTREAMS=https://cloudflare-dns.com/dns-query,https://dns.quad9.net/dn
 
 # --- Cloudflare ---------------------------------------------------------------
 
-# true  = the resolver record is proxied (orange cloud). Traefik then requires
-#         Cloudflare's client certificate (Authenticated Origin Pulls / mTLS), so
-#         anyone reaching the server IP directly fails the TLS handshake, and the
-#         rate limit applies per real client (CF-Connecting-IP).
-#         FIRST enable it in Cloudflare: SSL/TLS → Origin Server →
-#         Authenticated Origin Pulls → On. Otherwise every request fails.
-# false = DNS-only (grey cloud) or no Cloudflare.
+# Is the resolver record proxied (orange cloud)?
+#   true  = accept only Cloudflare (mTLS); direct hits on the server IP fail.
+#           Needs: Cloudflare → SSL/TLS → Origin Server → Authenticated Origin Pulls ON.
+#   false = grey cloud / no Cloudflare.
 CLOUDFLARE_PROXY=false
 
-# --- Traefik (defaults match Dokploy; change for a plain Traefik setup) ---
+# --- Traefik (defaults match Dokploy) -----------------------------------------
 
+# HTTPS entrypoint name in Traefik.
 TRAEFIK_ENTRYPOINT=websecure
 
-# Certificate for the endpoint:
-#   letsencrypt (or any resolver name) = Traefik obtains it via that ACME resolver.
-#   empty (TRAEFIK_CERT_RESOLVER=)      = use a certificate you already added, e.g.
-#       a Cloudflare Origin Certificate in Dokploy → Settings → Certificates.
-#       Cloudflare Origin certs are trusted only by Cloudflare: use them only with
-#       the orange cloud and SSL/TLS mode Full (strict).
-#   line removed entirely               = letsencrypt.
+# Who provides the TLS certificate?
+#   letsencrypt = Traefik gets one from Let's Encrypt (any ACME resolver name works).
+#   empty       = use a certificate already added in Dokploy → Settings → Certificates
+#                 (e.g. a Cloudflare Origin cert; orange cloud + Full (strict) only).
 TRAEFIK_CERT_RESOLVER=letsencrypt
-# Directory watched by Traefik's file provider. Must be the same path on the host
-# and inside the Traefik container (true for Dokploy).
+
+# Traefik's file-provider directory (same path on the host and in the container).
 TRAEFIK_DYNAMIC_DIR=/etc/dokploy/traefik/dynamic

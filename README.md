@@ -193,7 +193,7 @@ Setup:
 
 1. Move the domain's DNS to Cloudflare with every record **DNS only (grey)** first. Confirm everything still works.
 2. **SSL/TLS → Overview → Full (strict).**
-3. **Certificate:** either keep `TRAEFIK_CERT_RESOLVER=letsencrypt`, or create a Cloudflare Origin Certificate (SSL/TLS → Origin Server), add it in Dokploy → Settings → Certificates, and set `TRAEFIK_CERT_RESOLVER=` (empty). The Origin certificate lasts up to 15 years and needs no HTTP-01 renewals. Clients that bypass Cloudflare also don't trust it, which is a bonus.
+3. **Certificate:** either keep `TRAEFIK_CERT_RESOLVER=letsencrypt`, or create a Cloudflare Origin Certificate (SSL/TLS → Origin Server), add it in Dokploy → Settings → Certificates, and set `TRAEFIK_CERT_RESOLVER=` (empty). The Origin certificate lasts up to 15 years and needs no HTTP-01 renewals. Clients that bypass Cloudflare also don't trust it, which is a bonus. If you switch from Let's Encrypt, Traefik keeps serving the old exact-name certificate from `acme.json` (an exact name beats a wildcard). Remove that entry and restart Traefik to switch over.
 4. **SSL/TLS → Origin Server → Authenticated Origin Pulls → On.** This applies zone-wide. Other origins that don't ask for the certificate are unaffected.
 5. Turn the `resolver` record **Proxied (orange)**.
 6. Set `CLOUDFLARE_PROXY=true` and redeploy. Test: through Cloudflare → 200. Directly to the server IP (`curl --resolve resolver.example.com:443:<server-ip> …`) → TLS handshake error.
