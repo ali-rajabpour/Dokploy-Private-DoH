@@ -222,7 +222,7 @@ Design choices and limits:
 - **Certificate Transparency.** Your hostname appears in public CT logs as soon as a certificate is issued. The auth is what protects the endpoint, not an obscure hostname.
 - **Neighbour containers.** Blocky's HTTP port (4000) can be reached by other containers on the shared Traefik network (`dokploy-network`). Plain DNS is loopback-only.
 - **DNSSEC.** Blocky does not validate signatures itself. It relies on the upstream (NextDNS, Cloudflare and Quad9 all validate). Enable `dnssec.validate` in `blocky.yml` if you want local validation, at the cost of extra upstream lookups.
-- **During failover** your NextDNS blocklists and settings don't apply. Uncached queries also wait about 2 s (two 1 s timeouts, measured) for NextDNS to time out.
+- **During failover** your NextDNS blocklists and settings don't apply. Uncached queries also wait about 2 s (two 1 s timeouts) for NextDNS to time out.
 - **Geo answers.** CDNs pick servers near your **server**, not near you. Host the server close to where you are.
 
 Report security issues privately via [GitHub Security Advisories](https://github.com/ali-rajabpour/Dokploy-Private-DoH/security/advisories/new).
