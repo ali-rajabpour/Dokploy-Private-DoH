@@ -19,10 +19,12 @@ Run your own DoH endpoint (`https://resolver.example.com/dns-query`) that only y
 7. [Client setup](#client-setup)
 8. [Verifying the endpoint](#verifying-the-endpoint)
 9. [Cloudflare proxy (orange cloud)](#cloudflare-proxy-orange-cloud)
-10. [Security and threat model](#security-and-threat-model)
-11. [Upgrading from the dnscrypt-proxy / Unbound version](#upgrading-from-the-dnscrypt-proxy--unbound-version)
-12. [FAQ](#faq)
-13. [License](#license)
+10. [Performance and failover](#performance-and-failover)
+11. [Security and threat model](#security-and-threat-model)
+12. [Upgrading from the dnscrypt-proxy / Unbound version](#upgrading-from-the-dnscrypt-proxy--unbound-version)
+13. [Development](#development)
+14. [FAQ](#faq)
+15. [License](#license)
 
 ---
 
@@ -46,7 +48,7 @@ What it does **not** give you: more privacy from your upstream. NextDNS still se
 - **Strict upstream order** — Blocky `strategy: strict`: NextDNS, then Cloudflare, then Quad9, each tried only if the previous one fails or times out (1 s).
 - **Encrypted everywhere** — client → Traefik is HTTPS. Server → upstreams is DoH. Even the bootstrap lookups use DoH to an IP address.
 - **Cache with prefetching** — upstream TTLs are respected, with no forced minimums.
-- **Rate limiting** — per client IP, and it uses the real client IP behind Cloudflare.
+- **Rate limiting** — per real client behind Cloudflare (`CF-Connecting-IP`, trusted only because of mTLS).
 - **Cloudflare orange-cloud mode** — the origin completes TLS only for Cloudflare (Authenticated Origin Pulls / mTLS). Direct hits on the server IP fail the handshake.
 - **Your choice of certificate** — Let's Encrypt, or a certificate you already added (for example a Cloudflare Origin Certificate).
 - **Minimal attack surface**
@@ -81,7 +83,7 @@ Why DoH upstreams instead of DoT (port 853)? Many VPS providers block outbound 8
 ## Requirements
 
 - **Dokploy** — or any **Traefik v2.11+ or v3** that uses a file provider directory mounted at the same path inside the container. See the Traefik variables in [Configuration](#configuration).
-- A DNS A/AAAA record for `resolver.<your-domain>` pointing to the server.
+- A DNS A record for `resolver.<your-domain>` pointing to the server. Add AAAA only if the server has IPv6. Behind the Cloudflare proxy, clients get Cloudflare's IPv6 addresses either way.
 - Optional: a [NextDNS](https://nextdns.io) profile.
 - `htpasswd` (macOS built-in; `apache2-utils` on Debian/Ubuntu) and `openssl` to generate credentials.
 
@@ -99,7 +101,7 @@ Why DoH upstreams instead of DoT (port 853)? Many VPS providers block outbound 8
    ```
 
 3. **Environment tab** — paste the contents of [`env-example`](env-example) and fill in `DOMAIN`, `DOH_SECRET_PATH` and/or `DOH_USER` + `DOH_HASHED_PASS`, and `NEXTDNS_ID`. Each variable is explained in the file.
-4. **Deploy.** Check the `config-init` logs. It prints the endpoint, the enabled auth methods and the upstream order, or a clear error.
+4. **Deploy.** Check the `config-init` logs. It prints the endpoint, the enabled auth methods, the Cloudflare mode, the certificate source and the upstream order, or a clear error.
 5. **Test** with [Verifying the endpoint](#verifying-the-endpoint).
 
 Without Dokploy: `cp env-example .env`, edit it, set the Traefik variables, and make sure the external network in `docker-compose.yml` matches your Traefik network. Then run `docker compose up -d`.
@@ -123,7 +125,7 @@ All settings live in `.env` (the Dokploy Environment tab). [`env-example`](env-e
 
 At least one auth method must be set, or the deploy fails.
 
-Cache, logging and bootstrap settings are in [`blocky.yml`](blocky.yml). The `upstreams:` section is generated from `.env` on every deploy.
+Cache, logging and bootstrap settings are in [`blocky.yml`](blocky.yml). The `upstreams:` section is generated from `.env` on every deploy. A redeploy restarts Blocky only when its generated config changes, so auth-only changes cause no DNS interruption.
 
 **Plaintext vs hash:** `.env` holds the **hash** (`$2y$…`). Clients get the **plain password**. Putting the hash into a client always returns 401.
 
@@ -197,7 +199,19 @@ Setup:
 4. **SSL/TLS → Origin Server → Authenticated Origin Pulls → On.** This applies zone-wide. Other origins that don't ask for the certificate are unaffected.
 5. Turn the `resolver` record **Proxied (orange)**.
 6. Set `CLOUDFLARE_PROXY=true` and redeploy. Test: through Cloudflare → 200. Directly to the server IP (`curl --resolve resolver.example.com:443:<server-ip> …`) → TLS handshake error.
-7. If clients get 403s or challenge pages, add a WAF custom rule: *Hostname equals `resolver.example.com`* → **Skip** all security features. Or disable Bot Fight Mode. DoH clients cannot solve challenges.
+7. **Security → WAF → Custom rules:** *Hostname equals `resolver.example.com`* → **Skip** all remaining custom rules, rate limiting, managed rules, Browser Integrity Check, Security Level and Bot Fight Mode. This is required, not optional: Cloudflare's default checks return 403 to some non-browser user agents (for example Python's `urllib`), and DoH clients cannot solve challenges.
+
+Recommended zone settings (all verified working with this project):
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| DNS → DNSSEC | Enabled, DS added at the registrar | Signed answers for your domain. Check with `dig +dnssec resolver.example.com @1.1.1.1` (look for the `ad` flag). |
+| SSL/TLS → Edge Certificates → Minimum TLS | 1.2 | Drops legacy TLS. |
+| TLS 1.3 | On | Faster handshakes. |
+| 0-RTT Connection Resumption | Off | 0-RTT data can be replayed. |
+| Speed → HTTP/3 (QUIC) | On | Faster client → Cloudflare connections on lossy networks. |
+| Always Use HTTPS | On only with a Cloudflare Origin cert | With Let's Encrypt HTTP-01 it breaks renewals (see below). |
+| HSTS | Leave off unless you understand it | It applies zone-wide and is hard to undo. |
 
 With Let's Encrypt, leave **Always Use HTTPS** off, or exempt `/.well-known/acme-challenge/*`, so HTTP-01 renewals still reach Traefik.
 
@@ -206,6 +220,28 @@ Limits:
 - Zone-level Authenticated Origin Pulls uses a certificate shared by all Cloudflare customers. It proves "this came through Cloudflare", not "through *your* zone". Auth still protects the endpoint. Per-hostname AOP with your own certificate closes that gap.
 - The origin IP stays hidden only if **every** record pointing at the server is proxied. Passive-DNS databases also keep old records: if a record was ever grey, its IP is already on file.
 - The bundled `cloudflare-origin-pull-ca.pem` expires **2029-11-01**. Replace it from <https://developers.cloudflare.com/ssl/origin-configuration/authenticated-origin-pull/set-up/zone-level/> before then.
+
+## Performance and failover
+
+Measured on 2026-09-30. Client in the Middle East entering Cloudflare at Muscat, server in the Netherlands, Cloudflare proxy + mTLS on. Each query used a new TLS connection. Real clients keep HTTP/2 connections open, so they see less.
+
+| Path | Median per query |
+| --- | --- |
+| This endpoint (via Cloudflare → Traefik → Blocky → NextDNS) | **182 ms** |
+| NextDNS profile endpoint directly from the same client | 862 ms |
+| `cloudflare-dns.com` directly from the same client | blocked (connection reset) |
+
+- Almost all of the 182 ms is the client → Cloudflare → server network path. Blocky → NextDNS takes about 10 ms from the server.
+- The biggest win is on networks that throttle or block public DoH endpoints. Your own domain behind Cloudflare looks like any other website.
+
+**Failover, verified:** outbound traffic from the Blocky container to NextDNS was dropped with a temporary firewall rule, then queries were sent through the endpoint.
+
+| | Random `*.doubleclick.net` name | Answered by |
+| --- | --- | --- |
+| NextDNS reachable | NextDNS block page, ~190 ms | NextDNS profile |
+| NextDNS dropped | NXDOMAIN (unfiltered), ~2.2 s | Cloudflare fallback |
+
+The 2.2 s is two 1 s upstream timeouts before the fallback answers. It applies only to uncached names while NextDNS is down. Cached names stay instant.
 
 ## Security and threat model
 
@@ -241,15 +277,21 @@ Or stop and delete the three old containers in Dokploy. Then update the Environm
 - `DOH_SERVER_LISTEN` and `DOH_HTTP_PREFIX` are no longer used.
 - `NEXTDNS_ID` and `DOH_SECRET_PATH` are new.
 
+## Development
+
+- `sh tests/render-test.sh` renders sample configs and checks them, including rejection of invalid input. It runs with any POSIX `sh` and needs no Docker.
+- Blocky reads its config only at startup. When you change `blocky.yml` or the upstreams section of `config-init.sh`, bump `CONFIG_REV` in `docker-compose.yml`, so the next deploy restarts Blocky.
+- The Cloudflare origin-pull CA is `cloudflare-origin-pull-ca.pem` (public, expires 2029-11-01).
+
 ## FAQ
 
 **How do I change the upstreams?** Set `NEXTDNS_ID` and `FALLBACK_UPSTREAMS`, then redeploy.
 
-**How do I rotate credentials?** Generate a new secret or hash, update the Environment tab, and redeploy. The old value stops working immediately.
+**How do I rotate credentials?** Generate a new secret or hash, update the Environment tab, and redeploy. The old value stops working immediately. Rotate `DOH_SECRET_PATH` too: it is a credential, not just a URL.
 
 **Where are the logs?**
 - `docker compose logs config-init` — rendered endpoint, auth methods and upstream order, or validation errors.
-- `docker compose logs -f blocky` — resolver logs.
+- `docker compose logs -f blocky` — resolver logs. No per-query lines are logged.
 
 **Can I add blocklists?** Blocky supports them (`blocking:` in `blocky.yml`), but NextDNS already does this per profile. Keep blocking in one place.
 
