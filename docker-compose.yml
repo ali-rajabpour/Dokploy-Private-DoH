@@ -21,6 +21,14 @@ services:
         condition: service_completed_successfully
     environment:
       BLOCKY_CONFIG_FILE: /config/config.yml
+      # Blocky reads its config only at startup, and Compose recreates a
+      # container only when its own definition changes. Mirroring the inputs
+      # of the generated config here makes a redeploy restart Blocky exactly
+      # when that config changes.
+      # ponytail: bump CONFIG_REV by hand when blocky.yml or the upstreams
+      # section of config-init.sh changes.
+      CONFIG_REV: "2"
+      CONFIG_UPSTREAMS: "${NEXTDNS_ID:-}|${FALLBACK_UPSTREAMS:-}"
     volumes:
       - blocky-config:/config:ro
     networks:
