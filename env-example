@@ -41,7 +41,7 @@ DOH_HASHED_PASS=
 # blocklists, logs and settings apply. Leave empty to skip NextDNS.
 NEXTDNS_ID=
 
-# Tried in order, only when the previous upstream fails or times out (2s).
+# Tried in order, only when the previous upstream fails or times out (1s).
 # Comma-separated. Formats: https://host/path (DoH), tcp-tls:host (DoT), quic:host (DoQ).
 # NOTE: NextDNS blocklists do not apply to queries answered by fallbacks.
 FALLBACK_UPSTREAMS=https://cloudflare-dns.com/dns-query,https://dns.quad9.net/dns-query
